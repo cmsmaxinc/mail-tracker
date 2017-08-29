@@ -23,13 +23,19 @@ class SentEmail extends Model
         'meta'=>'collection',
     ];
 
+    public function getConnectionName()
+    {
+        $connName = config('mail-tracker.connection');
+        return $connName ?: config('database.default');
+    }
+
     /**
      * Returns a bootstrap class about the success/failure of the message
      * @return [type] [description]
      */
     public function getReportClassAttribute()
     {
-        if($this->meta->has('success')) {
+        if(!empty($this->meta) && $this->meta->has('success')) {
             if($this->meta->get('success')) {
                 return 'success';
             } else {
@@ -46,7 +52,10 @@ class SentEmail extends Model
      */
     public function getSmtpInfoAttribute()
     {
-        $meta = $this->meta;
+	    if (empty($this->meta)) {
+		    return '';
+	    }
+	    $meta = $this->meta;
         $responses = [];
         if($meta->has('smtpResponse')) {
             $response = $meta->get('smtpResponse');
@@ -55,7 +64,11 @@ class SentEmail extends Model
         }
         if($meta->has('failures')) {
             foreach($meta->get('failures') as $failure) {
-                $responses[] = $failure['status'].' ('.$failure['action'].'): '.$failure['diagnosticCode'].' ('.$failure['emailAddress'].')';
+                if(!empty($failure['status'])) {
+                    $responses[] = $failure['status'].' ('.$failure['action'].'): '.$failure['diagnosticCode'].' ('.$failure['emailAddress'].')';
+                } else {
+                    $responses[] = 'Generic Failure ('.$failure['emailAddress'].')';
+                }
             }
         } else if($meta->has('complaint')) {
             $complaint_time = $meta->get('complaint_time');

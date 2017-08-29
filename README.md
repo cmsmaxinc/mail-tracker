@@ -47,6 +47,9 @@ Run the migration
 $ php artisan migrate
 ```
 
+Note: If you would like to use a different connection to store your models, 
+you should update the mail-tracker.php config entry ```connection``` before running the migrations. 
+
 ## Install (Lumen)
 
 Via Composer
@@ -68,6 +71,9 @@ Run the migration
 $ php artisan migrate
 ```
 
+Note: If you would like to use a different connection to store your models, 
+you should update the mail-tracker.php config entry ```connection``` before running the migrations.
+
 ## Usage
 
 Once installed, all outgoing mail will be logged to the database.  The following config options are available in config/mail-tracker.php:
@@ -80,6 +86,15 @@ Once installed, all outgoing mail will be logged to the database.  The following
 * **admin-route**: The route information for the admin.  Set the prefix and middleware.
 * **admin-template**: The params for the Admin Panel and Views. You can integrate your existing Admin Panel with the MailTracker admin panel.
 * **date-format**: You can define the format to show dates in the Admin Panel.
+
+If you do not wish to have an email tracked, then you can add the ```X-No-Track``` header to your message.  Put any random string into this header to prevent the tracking from occurring.  The header will be removed from the email prior to being sent.
+
+``` php
+\Mail::send('email.test', [], function ($message) {
+    // ... other settings here
+    $message->getHeaders()->addTextHeader('X-No-Track',str_random(10));
+});
+```
 
 ## Events
 
@@ -202,7 +217,7 @@ and then in your event listener:
 public function handle(EmailSentEvent $event)
 {
     $tracker = $event->sent_email;
-    $model_id = $event->getHeader('X-Model-ID');
+    $model_id = $event->sent_email->getHeader('X-Model-ID');
     $model = Model::find($model_id);
     // Perform your tracking/linking tasks on $model knowing the SentEmail object
 }
@@ -212,7 +227,7 @@ Note that the headers you are attaching to the email are actually going out with
 
 ## Amazon SES features
 
-If you use Amazon SES, you can add some additional information to your tracking.  To set up the SES callbacks, first set up SES notifications under your domain in the SES control panel.  Then subscribe to the topic by going to the admin panel of the notification topic and creating a subscription for the URL you copied from the admin page.  The system should immediately respond to the subscription request.  If you like, you can use multiple subscriptions (i.e. one for delivery, one for bounces).  See above for events that are fired on a failed message.
+If you use Amazon SES, you can add some additional information to your tracking.  To set up the SES callbacks, first set up SES notifications under your domain in the SES control panel.  Then subscribe to the topic by going to the admin panel of the notification topic and creating a subscription for the URL you copied from the admin page.  The system should immediately respond to the subscription request.  If you like, you can use multiple subscriptions (i.e. one for delivery, one for bounces).  See above for events that are fired on a failed message.  **For added security, it is recommended to set the topic ARN into the mail-tracker config.**
 
 ## Views
 

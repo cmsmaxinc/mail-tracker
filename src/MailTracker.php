@@ -61,13 +61,13 @@ class MailTracker implements \Swift_Events_SendListener {
     protected function injectTrackingPixel($html, $hash)
     {
     	// Append the tracking url
-    	$tracking_pixel = '<img src="'.route('mailTracker_t',[$hash]).'" />';
+    	$tracking_pixel = '<img border=0 width=1 alt="" height=1 src="'.route('mailTracker_t',[$hash]).'" />';
 
     	$linebreak = str_random(32);
     	$html = str_replace("\n",$linebreak,$html);
 
     	if(preg_match("/^(.*<body[^>]*>)(.*)$/", $html, $matches)) {
-    		$html = $matches[1].$tracking_pixel.$matches[2];
+    		$html = $matches[1].$matches[2].$tracking_pixel;
     	} else {
     		$html = $html . $tracking_pixel;
     	}
@@ -92,7 +92,7 @@ class MailTracker implements \Swift_Events_SendListener {
         if (empty($matches[2])) {
             $url = app()->make('url')->to('/');
         } else {
-            $url = $matches[2];
+            $url = str_replace('&amp;', '&', $matches[2]);
         }
 
     	return $matches[1].route('mailTracker_l',
@@ -119,7 +119,16 @@ class MailTracker implements \Swift_Events_SendListener {
         foreach($message->getTo() as $to_email=>$to_name) {
             foreach($message->getFrom() as $from_email=>$from_name) {
                 $headers = $message->getHeaders();
-                $hash = str_random(32);
+                if($headers->get('X-No-Track')) {
+                    // Don't send with this header
+                    $headers->remove('X-No-Track');
+                    // Don't track this email
+                    continue;
+                }
+                do {
+                    $hash = str_random(32);
+                    $used = SentEmail::where('hash',$hash)->count();
+                } while($used > 0);
                 $headers->addTextHeader('X-Mailer-Hash',$hash);
                 $subject = $message->getSubject();
 
@@ -133,7 +142,6 @@ class MailTracker implements \Swift_Events_SendListener {
 
                 foreach ($message->getChildren() as $part) {
                     if (strpos($part->getContentType(), 'text/html') === 0) {
-                        $converter->setHTML($part->getBody());
                         $part->setBody($this->addTrackers($message->getBody(), $hash));
                     }
                 }
