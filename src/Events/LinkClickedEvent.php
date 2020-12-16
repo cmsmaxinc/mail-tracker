@@ -2,11 +2,12 @@
 
 namespace jdavidbakr\MailTracker\Events;
 
+use Illuminate\Queue\SerializesModels;
+use Illuminate\Contracts\Queue\ShouldQueue;
 use jdavidbakr\MailTracker\Model\SentEmail;
 use jdavidbakr\MailTracker\Model\SentEmailUrlClicked;
-use Illuminate\Queue\SerializesModels;
 
-class LinkClickedEvent
+class LinkClickedEvent implements ShouldQueue
 {
     use SerializesModels;
 

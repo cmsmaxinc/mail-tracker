@@ -1,491 +1,613 @@
 <?php
 
+namespace jdavidbakr\MailTracker\Tests;
+
+use Mockery;
+use Exception;
+use Throwable;
+use Faker\Factory;
+use Illuminate\Support\Str;
+use Swift_TransportException;
+use Illuminate\Support\Carbon;
+use Orchestra\Testbench\TestCase;
+use Illuminate\Support\Facades\Bus;
+use Illuminate\Support\Facades\Mail;
+use Illuminate\Support\Facades\View;
+use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Config;
 use jdavidbakr\MailTracker\MailTracker;
+use Illuminate\Mail\MailServiceProvider;
+use jdavidbakr\MailTracker\Model\SentEmail;
+use jdavidbakr\MailTracker\RecordBounceJob;
+use Orchestra\Testbench\Exceptions\Handler;
+use jdavidbakr\MailTracker\RecordDeliveryJob;
+use jdavidbakr\MailTracker\RecordTrackingJob;
+use jdavidbakr\MailTracker\RecordComplaintJob;
+use jdavidbakr\MailTracker\RecordLinkClickJob;
+use Illuminate\Contracts\Debug\ExceptionHandler;
+use jdavidbakr\MailTracker\Events\EmailSentEvent;
+use jdavidbakr\MailTracker\Events\ViewEmailEvent;
+use jdavidbakr\MailTracker\Exceptions\BadUrlLink;
+use jdavidbakr\MailTracker\Events\LinkClickedEvent;
+use Aws\Sns\MessageValidator as SNSMessageValidator;
+use jdavidbakr\MailTracker\Model\SentEmailUrlClicked;
+use jdavidbakr\MailTracker\Events\EmailDeliveredEvent;
 use Illuminate\Foundation\Testing\DatabaseTransactions;
-use Orchestra\Testbench\BrowserKit\TestCase;
+use jdavidbakr\MailTracker\Events\ComplaintMessageEvent;
+use jdavidbakr\MailTracker\Events\PermanentBouncedMessageEvent;
 
-class AddressVerificationTest extends TestCase
+class IgnoreExceptions extends Handler
 {
-    /**
-     * Setup the test environment.
-     */
-    public function setUp()
+    public function __construct()
     {
-        parent::setUp();
+    }
+    public function report(Throwable $e)
+    {
+    }
+    public function render($request, Throwable $e)
+    {
+        throw $e;
+    }
+}
 
-        $this->artisan('migrate', ['--database' => 'testing']);
+class MailTrackerTest extends SetUpTest
+{
+    protected function disableExceptionHandling()
+    {
+        $this->app->instance(ExceptionHandler::class, new IgnoreExceptions);
+    }
+
+    public function testSendMessage()
+    {
+        // Create an old email to purge
+        Config::set('mail-tracker.expire-days', 1);
+        $old_email = SentEmail::create([
+                'hash' => Str::random(32),
+            ]);
+        $old_url = SentEmailUrlClicked::create([
+                'sent_email_id' => $old_email->id,
+                'hash' => Str::random(32),
+            ]);
+        // Go into the future to make sure that the old email gets removed
+        \Carbon\Carbon::setTestNow(\Carbon\Carbon::now()->addWeek());
+        $str = Mockery::mock(Str::class);
+        app()->instance(Str::class, $str);
+        $str->shouldReceive('random')
+            ->once()
+            ->andReturn('random-hash');
+
+        Event::fake();
+
+        $faker = Factory::create();
+        $email = $faker->email;
+        $subject = $faker->sentence;
+        $name = $faker->firstName . ' ' .$faker->lastName;
+        \View::addLocation(__DIR__);
+        try {
+            \Mail::send('email.test', [], function ($message) use ($email, $subject, $name) {
+                $message->from('from@johndoe.com', 'From Name');
+                $message->sender('sender@johndoe.com', 'Sender Name');
+
+                $message->to($email, $name);
+
+                $message->cc('cc@johndoe.com', 'CC Name');
+                $message->bcc('bcc@johndoe.com', 'BCC Name');
+
+                $message->replyTo('reply-to@johndoe.com', 'Reply-To Name');
+
+                $message->subject($subject);
+
+                $message->priority(3);
+            });
+        } catch (Swift_TransportException $e) {
+        }
+
+        Event::assertDispatched(EmailSentEvent::class);
+
+        $this->assertDatabaseHas('sent_emails', [
+                'hash' => 'random-hash',
+                'recipient' => $name.' <'.$email.'>',
+                'subject' => $subject,
+                'sender' => 'From Name <from@johndoe.com>',
+                'recipient' => "{$name} <{$email}>",
+            ]);
+        $this->assertNull($old_email->fresh());
+        $this->assertNull($old_url->fresh());
+    }
+
+    public function testSendMessageWithMailRaw()
+    {
+        $faker = Factory::create();
+        $email = $faker->email;
+        $name = $faker->firstName . ' ' .$faker->lastName;
+        $content = 'Text to e-mail';
+        View::addLocation(__DIR__);
+        $str = Mockery::mock(Str::class);
+        app()->instance(Str::class, $str);
+        $str->shouldReceive('random')
+            ->once()
+            ->andReturn('random-hash');
+
+        try {
+            Mail::raw($content, function ($message) use ($email, $name) {
+                $message->from('from@johndoe.com', 'From Name');
+
+                $message->to($email, $name);
+            });
+        } catch (Swift_TransportException $e) {
+        }
+
+        $this->assertDatabaseHas('sent_emails', [
+            'hash' => 'random-hash',
+            'recipient' => $name.' <'.$email.'>',
+            'sender' => 'From Name <from@johndoe.com>',
+            'recipient' => "{$name} <{$email}>",
+            'content' => $content
+        ]);
     }
 
     /**
-     * Get package providers.  At a minimum this is the package being tested, but also
-     * would include packages upon which our package depends, e.g. Cartalyst/Sentry
-     * In a normal app environment these would be added to the 'providers' array in
-     * the config/app.php file.
-     *
-     * @param  \Illuminate\Foundation\Application  $app
-     *
-     * @return array
+     * @test
      */
-	protected function getPackageProviders($app)
-	{
-	    return ['jdavidbakr\MailTracker\MailTrackerServiceProvider'];
-	}
+    public function it_doesnt_track_if_told_not_to()
+    {
+        Event::fake();
 
-	/**
-     * Define environment setup.
-     *
-     * @param  \Illuminate\Foundation\Application  $app
-     *
-     * @return void
+        $faker = Factory::create();
+        $email = $faker->email;
+        $subject = $faker->sentence;
+        $name = $faker->firstName . ' ' .$faker->lastName;
+        \View::addLocation(__DIR__);
+        try {
+            \Mail::send('email.test', [], function ($message) use ($email, $subject, $name) {
+                $message->from('from@johndoe.com', 'From Name');
+                $message->sender('sender@johndoe.com', 'Sender Name');
+
+                $message->to($email, $name);
+
+                $message->cc('cc@johndoe.com', 'CC Name');
+                $message->bcc('bcc@johndoe.com', 'BCC Name');
+
+                $message->replyTo('reply-to@johndoe.com', 'Reply-To Name');
+
+                $message->subject($subject);
+
+                $message->priority(3);
+
+                $message->getHeaders()->addTextHeader('X-No-Track', Str::random(10));
+            });
+        } catch (Swift_TransportException $e) {
+        }
+
+        $this->assertDatabaseMissing('sent_emails', [
+                'recipient' => $name.' <'.$email.'>',
+                'subject' => $subject,
+                'sender' => 'From Name <from@johndoe.com>',
+                'recipient' => "{$name} <{$email}>",
+            ]);
+    }
+
+    /**
+     * @test
      */
-	protected function getEnvironmentSetUp($app)
-	{
-	    // Setup default database to use sqlite :memory:
-	    $app['config']->set('database.default', 'testbench');
-	    $app['config']->set('database.connections.testbench', [
-	        'driver'   => 'sqlite',
-	        'database' => ':memory:',
-	        'prefix'   => '',
-	    ]);
-	    $app['config']->set('database.connections.secondary', [
-	        'driver'   => 'sqlite',
-            'database' => ':memory:',
-            'prefix'   => ''
+    public function testPing()
+    {
+        Config::set('mail-tracker.tracker-queue', 'alt-queue');
+        Bus::fake();
+        $track = SentEmail::create([
+                'hash' => Str::random(32),
+            ]);
+        $pings = $track->opens;
+        $pings++;
+        $url = route('mailTracker_t', [$track->hash]);
+
+        $response = $this->get($url);
+
+        $response->assertSuccessful();
+        Bus::assertDispatched(RecordTrackingJob::class, function ($e) use ($track) {
+            return $e->sentEmail->id == $track->id &&
+                $e->queue == 'alt-queue';
+        });
+    }
+
+    public function testLegacyLink()
+    {
+        Config::set('mail-tracker.tracker-queue', 'alt-queue');
+        Bus::fake();
+        $track = SentEmail::create([
+                'hash' => Str::random(32),
+            ]);
+        $clicks = $track->clicks;
+        $clicks++;
+        $redirect = 'http://'.Str::random(15).'.com/'.Str::random(10).'/'.Str::random(10).'/'.rand(0, 100).'/'.rand(0, 100).'?page='.rand(0, 100).'&x='.Str::random(32);
+        $url = route('mailTracker_l', [
+                MailTracker::hash_url($redirect), // Replace slash with dollar sign
+                $track->hash
+            ]);
+        $response = $this->get($url);
+
+        $response->assertRedirect($redirect);
+        Bus::assertDispatched(RecordLinkClickJob::class, function ($job) use ($track, $redirect) {
+            return $job->sentEmail->id == $track->id &&
+                $job->url == $redirect &&
+                $job->queue == 'alt-queue';
+        });
+    }
+
+    public function testLink()
+    {
+        Config::set('mail-tracker.tracker-queue', 'alt-queue');
+        Bus::fake();
+        $track = SentEmail::create([
+                'hash' => Str::random(32),
+            ]);
+        $redirect = 'http://'.Str::random(15).'.com/'.Str::random(10).'/'.Str::random(10).'/'.rand(0, 100).'/'.rand(0, 100).'?page='.rand(0, 100).'&x='.Str::random(32);
+        $url = route('mailTracker_n', [
+                'l' => $redirect,
+                'h' => $track->hash
+            ]);
+            
+        $response = $this->get($url);
+
+        $response->assertRedirect($redirect);
+        Bus::assertDispatched(RecordLinkClickJob::class, function ($job) use ($track, $redirect) {
+            return $job->sentEmail->id == $track->id &&
+                $job->url == $redirect &&
+                $job->queue == 'alt-queue';
+        });
+    }
+
+    /**
+     * @test
+     */
+    public function it_throws_exception_on_invalid_link()
+    {
+        $this->disableExceptionHandling();
+        $this->expectException(BadUrlLink::class);
+        $track = SentEmail::create([
+                'hash' => Str::random(32),
+            ]);
+
+        Event::fake();
+
+        $clicks = $track->clicks;
+        $clicks++;
+
+        $redirect = 'http://'.Str::random(15).'.com/'.Str::random(10).'/'.Str::random(10).'/'.rand(0, 100).'/'.rand(0, 100).'?page='.rand(0, 100).'&x='.Str::random(32);
+
+        // Do it with an invalid hash
+        $url = route('mailTracker_n', [
+                'l' => $redirect,
+                'h' => 'bad-hash'
+            ]);
+        $response = $this->get($url);
+
+        $response->assertStatus(500);
+    }
+
+    /**
+     * @test
+     */
+    public function random_string_in_link_does_not_crash(Type $var = null)
+    {
+        $this->disableExceptionHandling();
+        $this->expectException(BadUrlLink::class);
+        $url = route('mailTracker_l', [
+            Str::random(32),
+            'the-mail-hash',
         ]);
-	    $app['config']->set('aws.credentials', [
-	        'key'    => env('AWS_ACCESS_KEY_ID'),
-	        'secret' => env('AWS_SECRET_ACCESS_KEY')
-	    ]);
-	    $app['config']->set('mail.from.address',env('FROM_EMAIL'));
-		$app['config']->set('app.debug',true);
-	}
 
-	public function testSendMessage()
-	{
-		// Create an old email to purge
-		Config::set('mail-tracker.expire-days', 1);
-		$old_email = \jdavidbakr\MailTracker\Model\SentEmail::create([
-				'hash'=>str_random(32),
-			]);
-		$old_url = \jdavidbakr\MailTracker\Model\SentEmailUrlClicked::create([
-				'sent_email_id'=>$old_email->id,
-				'hash'=>str_random(32),
-			]);
-		// Go into the future to make sure that the old email gets removed
-		\Carbon\Carbon::setTestNow(\Carbon\Carbon::now()->addWeek());
+        $this->get($url);
+    }
 
-		Event::fake();
+    /**
+     * @test
+     *
+     * Note that to complete this test, you must have aws credentials as well as a valid
+     * from address in the mail config.
+     */
+    public function it_retrieves_the_mesage_id_from_ses_mail_default()
+    {
+        Config::set('mail.default', 'ses');
+        Config::set('mail.driver', null);
+        $headers = Mockery::mock();
+        $headers->shouldReceive('get')
+            ->with('X-No-Track')
+            ->once()
+            ->andReturn(null);
+        $this->mailer_hash = '';
+        $headers->shouldReceive('addTextHeader')
+            ->once()
+            ->andReturnUsing(function ($key, $value) {
+                $this->mailer_hash = $value;
+            });
+        $mailer_hash_header = Mockery::mock();
+        $mailer_hash_header->shouldReceive('getFieldBody')
+            ->once()
+            ->andReturnUsing(function () {
+                return $this->mailer_hash;
+            });
+        $headers->shouldReceive('get')
+            ->with('X-Mailer-Hash')
+            ->once()
+            ->andReturn($mailer_hash_header);
+        $headers->shouldReceive('get')
+            ->with('X-SES-Message-ID')
+            ->once()
+            ->andReturn(Mockery::mock([
+                'getFieldBody' => 'aws-mailer-hash'
+            ]));
+        $headers->shouldReceive('toString')
+            ->once();
+        $event = Mockery::mock(\Swift_Events_SendEvent::class, [
+            'getMessage' => Mockery::mock([
+                'getTo' => [
+                    'destination@example.com' => 'Destination Person'
+                ],
+                'getFrom' => [
+                    'from@example.com' => 'From Name'
+                ],
+                'getHeaders' => $headers,
+                'getSubject' => 'The message subject',
+                'getBody' => 'The body',
+                'getContentType' => 'text/html',
+                'setBody' => null,
+                'getChildren' => [],
+                'getId' => 'message-id',
+            ]),
+        ]);
+        $tracker = new MailTracker();
 
-		$faker = Faker\Factory::create();
-		$email = $faker->email;
-		$subject = $faker->sentence;
-		$name = $faker->firstName . ' ' .$faker->lastName;
-		\View::addLocation(__DIR__);
-		\Mail::send('email.test', [], function ($message) use($email, $subject, $name) {
-		    $message->from('from@johndoe.com', 'From Name');
-		    $message->sender('sender@johndoe.com', 'Sender Name');
-		
-		    $message->to($email, $name);
-		
-		    $message->cc('cc@johndoe.com', 'CC Name');
-		    $message->bcc('bcc@johndoe.com', 'BCC Name');
-		
-		    $message->replyTo('reply-to@johndoe.com', 'Reply-To Name');
-		
-		    $message->subject($subject);
-		
-		    $message->priority(3);
-		});
+        $tracker->beforeSendPerformed($event);
+        $tracker->sendPerformed($event);
 
-		Event::assertDispatched(jdavidbakr\MailTracker\Events\EmailSentEvent::class);
+        $sent_email = SentEmail::orderBy('id', 'desc')->first();
+        $this->assertEquals('aws-mailer-hash', $sent_email->message_id);
+    }
 
-		$this->seeInDatabase('sent_emails',[
-				'recipient'=>$name.' <'.$email.'>',
-				'subject'=>$subject,
-				'sender'=>'From Name <from@johndoe.com>',
-				'recipient'=>"{$name} <{$email}>",
-			]);
-		$this->assertNull($old_email->fresh());
-		$this->assertNull($old_url->fresh());
-	}
+    /**
+     * @test
+     *
+     * Note that to complete this test, you must have aws credentials as well as a valid
+     * from address in the mail config.
+     */
+    public function it_retrieves_the_mesage_id_from_ses_mail_driver()
+    {
+        $str = Mockery::mock(Str::class);
+        app()->instance(Str::class, $str);
+        $str->shouldReceive('random')
+            ->with(32)
+            ->once()
+            ->andReturn('random-hash');
+        Config::set('mail.driver', 'ses');
+        Config::set('mail.default', null);
+        $headers = Mockery::mock();
+        $headers->shouldReceive('get')
+            ->with('X-No-Track')
+            ->once()
+            ->andReturn(null);
+        $headers->shouldReceive('addTextHeader')
+            ->once()
+            ->with('X-Mailer-Hash', 'random-hash');
+        $mailer_hash_header = Mockery::mock();
+        $mailer_hash_header->shouldReceive('getFieldBody')
+            ->once()
+            ->andReturnUsing(function () {
+                return 'random-hash';
+            });
+        $headers->shouldReceive('get')
+            ->with('X-Mailer-Hash')
+            ->once()
+            ->andReturn($mailer_hash_header);
+        $headers->shouldReceive('get')
+            ->with('X-SES-Message-ID')
+            ->once()
+            ->andReturn(Mockery::mock([
+                'getFieldBody' => 'aws-mailer-hash'
+            ]));
+        $headers->shouldReceive('toString')
+            ->once();
+        $event = Mockery::mock(\Swift_Events_SendEvent::class, [
+            'getMessage' => Mockery::mock([
+                'getTo' => [
+                    'destination@example.com' => 'Destination Person'
+                ],
+                'getFrom' => [
+                    'from@example.com' => 'From Name'
+                ],
+                'getHeaders' => $headers,
+                'getSubject' => 'The message subject',
+                'getBody' => 'The body',
+                'getContentType' => 'text/html',
+                'setBody' => null,
+                'getChildren' => [],
+                'getId' => 'message-id',
+            ]),
+        ]);
+        $tracker = new MailTracker();
 
-	/**
-	 * @test
-	 */
-	public function it_doesnt_track_if_told_not_to()
-	{
-		Event::fake();
+        $tracker->beforeSendPerformed($event);
+        $tracker->sendPerformed($event);
 
-		$faker = Faker\Factory::create();
-		$email = $faker->email;
-		$subject = $faker->sentence;
-		$name = $faker->firstName . ' ' .$faker->lastName;
-		\View::addLocation(__DIR__);
-		\Mail::send('email.test', [], function ($message) use($email, $subject, $name) {
-		    $message->from('from@johndoe.com', 'From Name');
-		    $message->sender('sender@johndoe.com', 'Sender Name');
-		
-		    $message->to($email, $name);
-		
-		    $message->cc('cc@johndoe.com', 'CC Name');
-		    $message->bcc('bcc@johndoe.com', 'BCC Name');
-		
-		    $message->replyTo('reply-to@johndoe.com', 'Reply-To Name');
-		
-		    $message->subject($subject);
-		
-		    $message->priority(3);
+        $sent_email = SentEmail::orderBy('id', 'desc')->first();
+        $this->assertEquals('aws-mailer-hash', $sent_email->message_id);
+    }
 
-		    $message->getHeaders()->addTextHeader('X-No-Track',str_random(10));
-		});
+    /**
+     * SNS Tests
+     */
 
-		$this->dontSeeInDatabase('sent_emails',[
-				'recipient'=>$name.' <'.$email.'>',
-				'subject'=>$subject,
-				'sender'=>'From Name <from@johndoe.com>',
-				'recipient'=>"{$name} <{$email}>",
-			]);
-	}
+    /**
+     * @test
+     */
+    public function it_confirms_a_subscription()
+    {
+        $url = action('\jdavidbakr\MailTracker\SNSController@callback');
+        $response = $this->post($url, [
+                'message' => json_encode([
+                        // Required
+                        'Message' => 'test subscription message',
+                        'MessageId' => Str::random(10),
+                        'Timestamp' => \Carbon\Carbon::now()->timestamp,
+                        'TopicArn' => Str::random(10),
+                        'Type' => 'SubscriptionConfirmation',
+                        'Signature' => Str::random(32),
+                        'SigningCertURL' => Str::random(32),
+                        'SignatureVersion' => 1,
+                        // Request-specific
+                        'SubscribeURL' => 'http://google.com',
+                        'Token' => Str::random(10),
+                    ])
+            ]);
+        $response->assertSee('subscription confirmed');
+    }
 
-	public function testPing()
-	{
-		$track = \jdavidbakr\MailTracker\Model\SentEmail::create([
-				'hash'=>str_random(32),
-			]);
+    /**
+     * @test
+     */
+    public function it_processes_with_registered_topic()
+    {
+        $topic = Str::random(32);
+        Config::set('mail-tracker.sns-topic', $topic);
+        $url = action('\jdavidbakr\MailTracker\SNSController@callback');
+        $response = $this->post($url, [
+                'message' => json_encode([
+                        // Required
+                        'Message' => 'test subscription message',
+                        'MessageId' => Str::random(10),
+                        'Timestamp' => \Carbon\Carbon::now()->timestamp,
+                        'TopicArn' => $topic,
+                        'Type' => 'SubscriptionConfirmation',
+                        'Signature' => Str::random(32),
+                        'SigningCertURL' => Str::random(32),
+                        'SignatureVersion' => 1,
+                        // Request-specific
+                        'SubscribeURL' => 'http://google.com',
+                        'Token' => Str::random(10),
+                    ])
+            ]);
+        $response->assertSee('subscription confirmed');
+    }
 
-		Event::fake();
+    /**
+     * @test
+     */
+    public function it_ignores_invalid_topic()
+    {
+        $topic = Str::random(32);
+        Config::set('mail-tracker.sns-topic', $topic);
+        $url = action('\jdavidbakr\MailTracker\SNSController@callback');
+        $response = $this->post($url, [
+                'message' => json_encode([
+                        // Required
+                        'Message' => 'test subscription message',
+                        'MessageId' => Str::random(10),
+                        'Timestamp' => \Carbon\Carbon::now()->timestamp,
+                        'TopicArn' => Str::random(32),
+                        'Type' => 'SubscriptionConfirmation',
+                        'Signature' => Str::random(32),
+                        'SigningCertURL' => Str::random(32),
+                        'SignatureVersion' => 1,
+                        // Request-specific
+                        'SubscribeURL' => 'http://google.com',
+                        'Token' => Str::random(10),
+                    ])
+            ]);
+        $response->assertSee('invalid topic ARN');
+    }
 
-		$pings = $track->opens;
-		$pings++;
+    /**
+     * @test
+     */
+    public function it_processes_a_delivery()
+    {
+        Config::set('mail-tracker.tracker-queue', 'alt-queue');
+        Bus::fake();
+        $message = [
+            'notificationType' => 'Delivery',
+        ];
 
-		$url = action('\jdavidbakr\MailTracker\MailTrackerController@getT',[$track->hash]);
-		$this->visit($url);
+        $response = $this->post(action('\jdavidbakr\MailTracker\SNSController@callback'), [
+                'message' => json_encode([
+                    'Message' => json_encode($message),
+                    'MessageId' => Str::uuid(),
+                    'Timestamp' => Carbon::now()->timestamp,
+                    'TopicArn' => Str::uuid(),
+                    'Type' => 'Notification',
+                    'Signature' => Str::uuid(),
+                    'SigningCertURL' => Str::uuid(),
+                    'SignatureVersion' => Str::uuid(),
+                ])
+            ]);
 
-		$track = $track->fresh();
-		$this->assertEquals($pings, $track->opens);
+        $response->assertSee('notification processed');
+        Bus::assertDispatched(RecordDeliveryJob::class, function ($job) use ($message) {
+            return $job->message == (object)$message &&
+                $job->queue == 'alt-queue';
+        });
+    }
 
-		Event::assertDispatched(jdavidbakr\MailTracker\Events\ViewEmailEvent::class);
-	}
+    /**
+     * @test
+     */
+    public function it_processes_a_bounce()
+    {
+        Config::set('mail-tracker.tracker-queue', 'alt-queue');
+        Bus::fake();
+        $message = [
+            'notificationType' => 'Bounce',
+        ];
 
-	public function testLink()
-	{
-		$track = \jdavidbakr\MailTracker\Model\SentEmail::create([
-				'hash'=>str_random(32),
-			]);
+        $response = $this->post(action('\jdavidbakr\MailTracker\SNSController@callback'), [
+                'message' => json_encode([
+                    'Message' => json_encode($message),
+                    'MessageId' => Str::uuid(),
+                    'Timestamp' => Carbon::now()->timestamp,
+                    'TopicArn' => Str::uuid(),
+                    'Type' => 'Notification',
+                    'Signature' => Str::uuid(),
+                    'SigningCertURL' => Str::uuid(),
+                    'SignatureVersion' => Str::uuid(),
+                ])
+            ]);
 
-		Event::fake();
+        $response->assertSee('notification processed');
+        Bus::assertDispatched(RecordBounceJob::class, function ($job) use ($message) {
+            return $job->message == (object)$message &&
+                $job->queue == 'alt-queue';
+        });
+    }
 
-		$clicks = $track->clicks;
-		$clicks++;
+    /**
+     * @test
+     */
+    public function it_processes_a_complaint()
+    {
+        Config::set('mail-tracker.tracker-queue', 'alt-queue');
+        Bus::fake();
+        $message = [
+            'notificationType' => 'Complaint',
+        ];
 
-		$redirect = 'http://'.str_random(15).'.com/'.str_random(10).'/'.str_random(10).'/'.rand(0,100).'/'.rand(0,100).'?page='.rand(0,100).'&x='.str_random(32);
+        $response = $this->post(action('\jdavidbakr\MailTracker\SNSController@callback'), [
+                'message' => json_encode([
+                    'Message' => json_encode($message),
+                    'MessageId' => Str::uuid(),
+                    'Timestamp' => Carbon::now()->timestamp,
+                    'TopicArn' => Str::uuid(),
+                    'Type' => 'Notification',
+                    'Signature' => Str::uuid(),
+                    'SigningCertURL' => Str::uuid(),
+                    'SignatureVersion' => Str::uuid(),
+                ])
+            ]);
 
-		$url = action('\jdavidbakr\MailTracker\MailTrackerController@getL',[
-    			\jdavidbakr\MailTracker\MailTracker::hash_url($redirect), // Replace slash with dollar sign
-				$track->hash
-			]);
-		$this->call('GET',$url);
-		$this->assertRedirectedTo($redirect);
-
-		Event::assertDispatched(jdavidbakr\MailTracker\Events\LinkClickedEvent::class);
-
-		$this->seeInDatabase('sent_emails_url_clicked',[
-				'url'=>$redirect,
-				'clicks'=>1,
-			]);
-
-		$track = $track->fresh();
-		$this->assertEquals($clicks, $track->clicks);
-
-		// Do it with an invalid hash
-		$url = action('\jdavidbakr\MailTracker\MailTrackerController@getL',[
-    			\jdavidbakr\MailTracker\MailTracker::hash_url($redirect), // Replace slash with dollar sign
-				'bad-hash'
-			]);
-		$this->call('GET',$url);
-		$this->assertRedirectedTo($redirect);
-	}
-
-	/**
-	 * @test
-	 *
-	 * Note that to complete this test, you must have aws credentials as well as a valid
-	 * from address in the mail config.
-	 */
-	public function it_retrieves_the_mesage_id_from_ses()
-	{
-		if(!config('aws.credentials.key') || config('mail.from.address') == null) {
-			$this->markTestIncomplete();
-			return;
-		}
-		Config::set('mail.driver', 'ses');
-		(new Illuminate\Mail\MailServiceProvider(app()))->register();
-		// Must re-register the MailTracker to get the test to work
-        $this->app['mailer']->getSwiftMailer()->registerPlugin(new MailTracker());
-
-		$faker = Faker\Factory::create();
-		$email = 'success@simulator.amazonses.com';
-		$subject = $faker->sentence;
-		$name = $faker->firstName . ' ' .$faker->lastName;
-		\View::addLocation(__DIR__);
-		\Mail::send('email.test', [], function ($message) use($email, $subject, $name) {
-		    $message->to($email, $name);
-		
-		    $message->replyTo('reply-to@johndoe.com', 'Reply-To Name');
-		
-		    $message->subject($subject);
-		
-		    $message->priority(3);
-		});
-		$sent_email = \jdavidbakr\MailTracker\Model\SentEmail::orderBy('id','desc')->first();
-		$this->assertEquals(0, preg_match('/swift\.generated/',$sent_email->message_id));
-	}
-
-	/**
-	 * SNS Tests
-	 */
-	
-	/**
-	 * @test
-	 */
-	public function it_confirms_a_subscription()
-	{
-		$url = action('\jdavidbakr\MailTracker\SNSController@callback');
-		$this->post($url,[
-				'message'=>json_encode([
-						// Required
-				        'Message'=>'test subscription message',
-				        'MessageId'=>str_random(10),
-				        'Timestamp'=>\Carbon\Carbon::now()->timestamp,
-				        'TopicArn'=>str_random(10),
-				        'Type'=>'SubscriptionConfirmation',
-				        'Signature'=>str_random(32),
-				        'SigningCertURL'=>str_random(32),
-				        'SignatureVersion'=>1,
-				        // Request-specific
-						'SubscribeURL'=>'http://google.com',
-						'Token'=>str_random(10),
-					])
-			]);
-		$this->see('subscription confirmed');
-	}
-
-	/**
-	 * @test
-	 */
-	public function it_processes_with_registered_topic()
-	{
-		$topic = str_random(32);
-		Config::set('mail-tracker.sns-topic',$topic);
-		$url = action('\jdavidbakr\MailTracker\SNSController@callback');
-		$this->post($url,[
-				'message'=>json_encode([
-						// Required
-				        'Message'=>'test subscription message',
-				        'MessageId'=>str_random(10),
-				        'Timestamp'=>\Carbon\Carbon::now()->timestamp,
-				        'TopicArn'=>$topic,
-				        'Type'=>'SubscriptionConfirmation',
-				        'Signature'=>str_random(32),
-				        'SigningCertURL'=>str_random(32),
-				        'SignatureVersion'=>1,
-				        // Request-specific
-						'SubscribeURL'=>'http://google.com',
-						'Token'=>str_random(10),
-					])
-			]);
-		$this->see('subscription confirmed');
-	}
-
-	/**
-	 * @test
-	 */
-	public function it_ignores_invalid_topic()
-	{
-		$topic = str_random(32);
-		Config::set('mail-tracker.sns-topic',$topic);
-		$url = action('\jdavidbakr\MailTracker\SNSController@callback');
-		$this->post($url,[
-				'message'=>json_encode([
-						// Required
-				        'Message'=>'test subscription message',
-				        'MessageId'=>str_random(10),
-				        'Timestamp'=>\Carbon\Carbon::now()->timestamp,
-				        'TopicArn'=>str_random(32),
-				        'Type'=>'SubscriptionConfirmation',
-				        'Signature'=>str_random(32),
-				        'SigningCertURL'=>str_random(32),
-				        'SignatureVersion'=>1,
-				        // Request-specific
-						'SubscribeURL'=>'http://google.com',
-						'Token'=>str_random(10),
-					])
-			]);
-		$this->See('invalid topic ARN');
-	}
-
-	/**
-	 * @test
-	 */
-	public function it_processes_a_delivery()
-	{
-		$track = \jdavidbakr\MailTracker\Model\SentEmail::create([
-				'hash'=>str_random(32),
-			]);
-		$message_id = str_random(32);
-		$track->message_id = $message_id;
-		$track->save();
-
-		$this->post(action('\jdavidbakr\MailTracker\SNSController@callback'),[
-				'message'=>json_encode([
-						// Required
-				        'Message'=>json_encode([
-							'notificationType'=>'Delivery',
-							'mail'=>[
-								'timestamp'=>\Carbon\Carbon::now()->timestamp,
-								'messageId'=>$message_id,
-								'source'=>$track->sender,
-								'sourceArn'=>str_random(32),
-								'sendingAccountId'=>str_random(10),
-								'destination'=>[$track->recipient],
-							],
-					        'delivery'=>[
-					        	'timestamp'=>\Carbon\Carbon::now()->timestamp,
-					        	'processingTimeMillis'=>1000,
-					        	'recipients'=>[$track->recipient],
-					        	'smtpResponse'=>'test smtp response',
-					        	'reportingMTA'=>str_random(10),
-					        ],
-				        ]),
-				        'MessageId'=>str_random(10),
-				        'Timestamp'=>\Carbon\Carbon::now()->timestamp,
-				        'TopicArn'=>str_random(10),
-				        'Type'=>'Notification',
-				        'Signature'=>str_random(32),
-				        'SigningCertURL'=>str_random(32),
-				        'SignatureVersion'=>1,
-				        // Request-specific
-				        
-					])
-			]);
-		$this->see('notification processed');
-		$track = $track->fresh();
-		$meta = $track->meta;
-		$this->assertEquals('test smtp response',$meta->get('smtpResponse'));
-		$this->assertTrue($meta->get('success'));
-	}
-
-	/**
-	 * @test
-	 */
-	public function it_processes_a_bounce()
-	{
-		$track = \jdavidbakr\MailTracker\Model\SentEmail::create([
-				'hash'=>str_random(32),
-			]);
-		$message_id = str_random(32);
-		$track->message_id = $message_id;
-		$track->save();
-
-		$this->post(action('\jdavidbakr\MailTracker\SNSController@callback'),[
-				'message'=>json_encode([
-						// Required
-				        'Message'=>json_encode([
-							'notificationType'=>'Bounce',
-							'mail'=>[
-								'timestamp'=>\Carbon\Carbon::now()->timestamp,
-								'messageId'=>$message_id,
-								'source'=>$track->sender,
-								'sourceArn'=>str_random(32),
-								'sendingAccountId'=>str_random(10),
-								'destination'=>[$track->recipient],
-							],
-					        'bounce'=>[
-					        	'bounceType'=>'Permanent',
-					        	'bounceSubType'=>'General',
-					        	'bouncedRecipients'=>[
-					        		[
-						        		'status'=>'5.0.0',
-						        		'action'=>'failed',
-						        		'diagnosticCode'=>'smtp; 550 user unknown',
-						        		'emailAddress'=>'recipient@example.com',
-					        		],
-					        	],
-								'timestamp'=>\Carbon\Carbon::now()->timestamp,
-								'feedbackId'=>str_random(10),
-					        ],
-				        ]),
-				        'MessageId'=>str_random(10),
-				        'Timestamp'=>\Carbon\Carbon::now()->timestamp,
-				        'TopicArn'=>str_random(10),
-				        'Type'=>'Notification',
-				        'Signature'=>str_random(32),
-				        'SigningCertURL'=>str_random(32),
-				        'SignatureVersion'=>1,
-				        // Request-specific
-				        
-					])
-			]);
-		$this->see('notification processed');
-		$track = $track->fresh();
-		$meta = $track->meta;
-		$this->assertFalse($meta->get('success'));
-	}
-
-	/**
-	 * @test
-	 */
-	public function it_processes_a_complaint()
-	{
-		$track = \jdavidbakr\MailTracker\Model\SentEmail::create([
-				'hash'=>str_random(32),
-			]);
-		$message_id = str_random(32);
-		$track->message_id = $message_id;
-		$track->save();
-
-		$this->post(action('\jdavidbakr\MailTracker\SNSController@callback'),[
-				'message'=>json_encode([
-						// Required
-				        'Message'=>json_encode([
-							'notificationType'=>'Complaint',
-							'mail'=>[
-								'timestamp'=>\Carbon\Carbon::now()->timestamp,
-								'messageId'=>$message_id,
-								'source'=>$track->sender,
-								'sourceArn'=>str_random(32),
-								'sendingAccountId'=>str_random(10),
-								'destination'=>[$track->recipient],
-							],
-					        'complaint'=>[
-					        	'complainedRecipients'=>[
-					        		[
-						        		'emailAddress'=>'recipient@example.com',
-					        		],
-					        	],
-								'timestamp'=>\Carbon\Carbon::now()->timestamp,
-								'feedbackId'=>str_random(10),
-								'userAgent'=>str_random(10),
-								'complaintFeedbackType'=>'feedback type',
-								'arrivalDate'=>\Carbon\Carbon::now(),
-					        ],
-				        ]),
-				        'MessageId'=>str_random(10),
-				        'Timestamp'=>\Carbon\Carbon::now()->timestamp,
-				        'TopicArn'=>str_random(10),
-				        'Type'=>'Notification',
-				        'Signature'=>str_random(32),
-				        'SigningCertURL'=>str_random(32),
-				        'SignatureVersion'=>1,
-				        // Request-specific
-				        
-					])
-			]);
-		$this->see('notification processed');
-		$track = $track->fresh();
-		$meta = $track->meta;
-		$this->assertFalse($meta->get('success'));
-	}/** @noinspection ProblematicWhitespace */
+        $response->assertSee('notification processed');
+        Bus::assertDispatched(RecordComplaintJob::class, function ($job) use ($message) {
+            return $job->message == (object)$message &&
+                $job->queue == 'alt-queue';
+        });
+    }
 
     /**
      * @test
@@ -496,17 +618,17 @@ class AddressVerificationTest extends TestCase
         Config::set('mail-tracker.track-links', true);
         Config::set('mail-tracker.inject-pixel', true);
         Config::set('mail.driver', 'array');
-        (new Illuminate\Mail\MailServiceProvider(app()))->register();
+        (new MailServiceProvider(app()))->register();
         // Must re-register the MailTracker to get the test to work
         $this->app['mailer']->getSwiftMailer()->registerPlugin(new MailTracker());
 
-        $faker = Faker\Factory::create();
+        $faker = Factory::create();
         $email = $faker->email;
         $subject = $faker->sentence;
         $name = $faker->firstName . ' ' .$faker->lastName;
-        \View::addLocation(__DIR__);
+        View::addLocation(__DIR__);
 
-        \Mail::send('email.testAmpersand', [], function ($message) use($email, $subject, $name) {
+        Mail::send('email.testAmpersand', [], function ($message) use ($email, $subject, $name) {
             $message->from('from@johndoe.com', 'From Name');
             $message->sender('sender@johndoe.com', 'Sender Name');
 
@@ -521,8 +643,7 @@ class AddressVerificationTest extends TestCase
 
             $message->priority(3);
         });
-
-        $driver = $this->app['swift.transport']->driver();
+        $driver = app('mailer')->getSwiftMailer()->getTransport();
         $this->assertEquals(1, count($driver->messages()));
 
         $mes = $driver->messages()[0];
@@ -538,53 +659,117 @@ class AddressVerificationTest extends TestCase
         $this->assertNotNull($aLink);
         $this->assertNotEquals($expected_url, $aLink);
 
-        $this->call('GET',$aLink);
-        $this->assertRedirectedTo($expected_url);
+        $response = $this->call('GET', $aLink);
+        $response->assertRedirect($expected_url);
 
-        Event::assertDispatched(jdavidbakr\MailTracker\Events\LinkClickedEvent::class);
+        Event::assertDispatched(LinkClickedEvent::class);
 
-        $this->seeInDatabase('sent_emails_url_clicked',[
+        $this->assertDatabaseHas('sent_emails_url_clicked', [
             'url' => $expected_url,
             'clicks' => 1,
         ]);
 
-        $track = \jdavidbakr\MailTracker\Model\SentEmail::whereHash($hash)->first();
+        $track = SentEmail::whereHash($hash)->first();
         $this->assertNotNull($track);
         $this->assertEquals(1, $track->clicks);
     }
 
     /**
-	 * @test
-	 */
-	public function it_retrieves_header_data()
-	{
-		$faker = Faker\Factory::create();
-		$email = $faker->email;
-		$subject = $faker->sentence;
-		$name = $faker->firstName . ' ' .$faker->lastName;
-		$header_test = str_random(10);
-		\View::addLocation(__DIR__);
-		\Mail::send('email.test', [], function ($message) use($email, $subject, $name, $header_test) {
-		    $message->from('from@johndoe.com', 'From Name');
-		    $message->sender('sender@johndoe.com', 'Sender Name');
-		
-		    $message->to($email, $name);
-		
-		    $message->cc('cc@johndoe.com', 'CC Name');
-		    $message->bcc('bcc@johndoe.com', 'BCC Name');
-		
-		    $message->replyTo('reply-to@johndoe.com', 'Reply-To Name');
-		
-		    $message->subject($subject);
-		
-		    $message->priority(3);
+     * @test
+     */
+    public function it_handles_apostrophes_in_links()
+    {
+        Event::fake();
+        Config::set('mail-tracker.track-links', true);
+        Config::set('mail-tracker.inject-pixel', true);
+        Config::set('mail.driver', 'array');
+        (new MailServiceProvider(app()))->register();
+        // Must re-register the MailTracker to get the test to work
+        $this->app['mailer']->getSwiftMailer()->registerPlugin(new MailTracker());
 
-		    $message->getHeaders()->addTextHeader('X-Header-Test',$header_test);
-		});
+        $faker = Factory::create();
+        $email = $faker->email;
+        $subject = $faker->sentence;
+        $name = $faker->firstName . ' ' . $faker->lastName;
+        View::addLocation(__DIR__);
 
-		$track = \jdavidbakr\MailTracker\Model\SentEmail::orderBy('id','desc')->first();
-		$this->assertEquals($header_test, $track->getHeader('X-Header-Test'));
-	}
+        Mail::send('email.testApostrophe', [], function ($message) use ($email, $subject, $name) {
+            $message->from('from@johndoe.com', 'From Name');
+            $message->sender('sender@johndoe.com', 'Sender Name');
+            $message->to($email, $name);
+            $message->cc('cc@johndoe.com', 'CC Name');
+            $message->bcc('bcc@johndoe.com', 'BCC Name');
+            $message->replyTo('reply-to@johndoe.com', 'Reply-To Name');
+            $message->subject($subject);
+            $message->priority(3);
+        });
+        $driver = app('mailer')->getSwiftMailer()->getTransport();
+        $this->assertEquals(1, count($driver->messages()));
+
+        $mes = $driver->messages()[0];
+        $body = $mes->getBody();
+        $hash = $mes->getHeaders()->get('X-Mailer-Hash')->getValue();
+
+        $matches = null;
+        preg_match_all('/(<a[^>]*href=[\"])([^\"]*)/', $body, $matches);
+        $links = $matches[2];
+        $aLink = $links[0];
+
+        $expected_url = "http://www.google.com?q=foo'bar";
+        $this->assertNotNull($aLink);
+        $this->assertNotEquals($expected_url, $aLink);
+
+        $response = $this->call('GET', $aLink);
+        $response->assertRedirect($expected_url);
+
+        Event::assertDispatched(LinkClickedEvent::class);
+
+        $this->assertDatabaseHas('sent_emails_url_clicked', [
+            'url' => $expected_url,
+            'clicks' => 1,
+        ]);
+
+        $track = SentEmail::whereHash($hash)->first();
+        $this->assertNotNull($track);
+        $this->assertEquals(1, $track->clicks);
+    }
+
+
+    /**
+     * @test
+     */
+    public function it_retrieves_header_data()
+    {
+        $faker = Factory::create();
+        $email = $faker->email;
+        $subject = $faker->sentence;
+        $name = $faker->firstName . ' ' .$faker->lastName;
+        $header_test = Str::random(10);
+        \View::addLocation(__DIR__);
+        try {
+            \Mail::send('email.test', [], function ($message) use ($email, $subject, $name, $header_test) {
+                $message->from('from@johndoe.com', 'From Name');
+                $message->sender('sender@johndoe.com', 'Sender Name');
+
+                $message->to($email, $name);
+
+                $message->cc('cc@johndoe.com', 'CC Name');
+                $message->bcc('bcc@johndoe.com', 'BCC Name');
+
+                $message->replyTo('reply-to@johndoe.com', 'Reply-To Name');
+
+                $message->subject($subject);
+
+                $message->priority(3);
+
+                $message->getHeaders()->addTextHeader('X-Header-Test', $header_test);
+            });
+        } catch (Swift_TransportException $e) {
+        }
+
+        $track = SentEmail::orderBy('id', 'desc')->first();
+        $this->assertEquals($header_test, $track->getHeader('X-Header-Test'));
+    }
 
     /**
      * @test
@@ -598,48 +783,90 @@ class AddressVerificationTest extends TestCase
         $this->app['migrator']->setConnection('secondary');
         $this->artisan('migrate', ['--database' => 'secondary']);
 
-        $old_email = \jdavidbakr\MailTracker\Model\SentEmail::create([
-            'hash'=>str_random(32),
+        $old_email = SentEmail::create([
+            'hash' => Str::random(32),
         ]);
-        $old_url = \jdavidbakr\MailTracker\Model\SentEmailUrlClicked::create([
-            'sent_email_id'=>$old_email->id,
-            'hash'=>str_random(32),
+        $old_url = SentEmailUrlClicked::create([
+            'sent_email_id' => $old_email->id,
+            'hash' => Str::random(32),
         ]);
         // Go into the future to make sure that the old email gets removed
         \Carbon\Carbon::setTestNow(\Carbon\Carbon::now()->addWeek());
 
         Event::fake();
 
-        $faker = Faker\Factory::create();
+        $faker = Factory::create();
         $email = $faker->email;
         $subject = $faker->sentence;
         $name = $faker->firstName . ' ' .$faker->lastName;
         \View::addLocation(__DIR__);
-        \Mail::send('email.test', [], function ($message) use($email, $subject, $name) {
-            $message->from('from@johndoe.com', 'From Name');
-            $message->sender('sender@johndoe.com', 'Sender Name');
+        try {
+            \Mail::send('email.test', [], function ($message) use ($email, $subject, $name) {
+                $message->from('from@johndoe.com', 'From Name');
+                $message->sender('sender@johndoe.com', 'Sender Name');
 
-            $message->to($email, $name);
+                $message->to($email, $name);
 
-            $message->cc('cc@johndoe.com', 'CC Name');
-            $message->bcc('bcc@johndoe.com', 'BCC Name');
+                $message->cc('cc@johndoe.com', 'CC Name');
+                $message->bcc('bcc@johndoe.com', 'BCC Name');
 
-            $message->replyTo('reply-to@johndoe.com', 'Reply-To Name');
+                $message->replyTo('reply-to@johndoe.com', 'Reply-To Name');
 
-            $message->subject($subject);
+                $message->subject($subject);
 
-            $message->priority(3);
-        });
+                $message->priority(3);
+            });
+        } catch (Swift_TransportException $e) {
+        }
 
-        Event::assertDispatched(jdavidbakr\MailTracker\Events\EmailSentEvent::class);
+        Event::assertDispatched(EmailSentEvent::class);
 
-        $this->seeInDatabase('sent_emails',[
-            'recipient'=>$name.' <'.$email.'>',
-            'subject'=>$subject,
-            'sender'=>'From Name <from@johndoe.com>'
-        ],'secondary');
+        $this->assertDatabaseHas('sent_emails', [
+            'recipient' => $name.' <'.$email.'>',
+            'subject' => $subject,
+            'sender' => 'From Name <from@johndoe.com>'
+        ], 'secondary');
         $this->assertNull($old_email->fresh());
         $this->assertNull($old_url->fresh());
     }
-}
 
+    /**
+     * @test
+     */
+    public function it_can_retrieve_url_clicks_from_eloquent()
+    {
+        Event::fake();
+        $track = SentEmail::create([
+            'hash' => Str::random(32),
+        ]);
+        $message_id = Str::random(32);
+        $track->message_id = $message_id;
+        $track->save();
+
+        $urlClick = SentEmailUrlClicked::create([
+            'sent_email_id' => $track->id,
+            'url' => 'https://example.com',
+            'hash' => Str::random(32)
+        ]);
+        $urlClick->save();
+        $this->assertTrue($track->urlClicks->count() === 1);
+        $this->assertInstanceOf(\Illuminate\Support\Collection::class, $track->urlClicks);
+        $this->assertInstanceOf(SentEmailUrlClicked::class, $track->urlClicks->first());
+    }
+
+    /**
+     * @test
+     */
+    public function it_handles_headers_with_colons()
+    {
+        $headerData = '{"some_id":2,"some_othger_id":"0dd75231-31bb-4e67-8ab7-a83315f75a44","some_field":"A Field Value"}';
+        $track = SentEmail::create([
+            'hash' => Str::random(32),
+            'headers' => 'X-MyHeader: '.$headerData,
+        ]);
+
+        $retrieval = $track->getHeader('X-MyHeader');
+
+        $this->assertEquals($headerData, $retrieval);
+    }
+}
